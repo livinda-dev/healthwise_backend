@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import { runFlow } from "@genkit-ai/flow";
-import { healthAssistant } from "./flows/healthAssistant";
+import { healthAssistant } from "./flows/healthAssistant.js";
 dotenv.config();
 const app = express();
 app.use(express.json());
