@@ -8,18 +8,18 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// POST endpoint that manually executes the flow
 app.post("/healthAssistant", async (req, res) => {
   try {
-    const input = req.body.input || req.body; // <-- add this line
+    const input = req.body.input || req.body; // 👈 handle Genkit wrapper
     const result = await runFlow(healthAssistant, input);
     res.json(result);
   } catch (err) {
     console.error("Error running flow:", err);
-    res.status(500).json({ error: (err as Error).message || "Internal Server Error" });
+    res
+      .status(500)
+      .json({ error: (err as Error).message || "Internal Server Error" });
   }
 });
-
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
