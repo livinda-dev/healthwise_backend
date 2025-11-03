@@ -44,12 +44,13 @@ ${conversation}
 `;
 
     const result = await ai.generate({
-      model: 'models/gemini-1.5-flash',
-      prompt,
-      config: {
-        temperature: 0.7,
-      },
-    });
+  model: 'gemini-1.5-flash', // ✅ fixed model name
+  prompt,
+  config: {
+    temperature: 0.7,
+  },
+});
+
 
     const text = result.text;
 
