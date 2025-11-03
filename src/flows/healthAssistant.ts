@@ -44,7 +44,7 @@ ${conversation}
 `;
 
     const result = await ai.generate({
-  model: 'gemini-2.5-flash', // ✅ a valid model from your API key
+  model: 'models/gemini-2.5-flash', // ✅ a valid model from your API key
   prompt,
   config: {
     temperature: 0.7,
