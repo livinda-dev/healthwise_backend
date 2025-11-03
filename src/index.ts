@@ -10,9 +10,16 @@ app.use(express.json());
 
 app.post("/healthAssistant", async (req, res) => {
   try {
-    console.log("🟢 Incoming request body:", JSON.stringify(req.body, null, 2)); // 👈 ADD THIS
-    const input = req.body.input || req.body;
-    console.log("🟡 Using input for flow:", JSON.stringify(input, null, 2)); // 👈 ADD THIS
+    console.log("🟢 Incoming request body:", JSON.stringify(req.body, null, 2));
+
+    // ✅ Handles all cases: Flutter (data.messages), Genkit, or plain
+    const input = req.body.data?.messages
+      ? req.body.data
+      : req.body.input?.input ||
+        req.body.input ||
+        req.body;
+
+    console.log("🟡 Using input for flow:", JSON.stringify(input, null, 2));
 
     const result = await runFlow(healthAssistant, input);
     res.json(result);
@@ -23,6 +30,7 @@ app.post("/healthAssistant", async (req, res) => {
       .json({ error: (err as Error).message || "Internal Server Error" });
   }
 });
+
 
 
 const port = process.env.PORT || 8080;
