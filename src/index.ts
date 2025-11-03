@@ -1,5 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
+import 'dotenv/config';
 import { runFlow } from "@genkit-ai/flow";
 import { healthAssistant } from "./flows/healthAssistant.js";
 

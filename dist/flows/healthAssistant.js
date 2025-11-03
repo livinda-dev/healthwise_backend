@@ -3,7 +3,11 @@ import { googleAI } from "@genkit-ai/google-genai";
 import { genkit } from 'genkit';
 import { z } from "zod";
 const ai = genkit({
-    plugins: [googleAI()],
+    plugins: [
+        googleAI({
+            apiKey: process.env.GOOGLE_GENAI_API_KEY,
+        }),
+    ],
 });
 const messageSchema = z.object({
     messages: z.array(z.object({
@@ -30,7 +34,7 @@ Conversation so far:
 ${conversation}
 `;
     const result = await ai.generate({
-        model: 'gemini-1.5-flash',
+        model: 'models/gemini-1.5-flash',
         prompt,
         config: {
             temperature: 0.7,
