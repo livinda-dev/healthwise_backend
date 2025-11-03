@@ -11,7 +11,7 @@ app.use(express.json());
 // POST endpoint that manually executes the flow
 app.post("/healthAssistant", async (req, res) => {
   try {
-    const input = req.body;
+    const input = req.body.input || req.body; // <-- add this line
     const result = await runFlow(healthAssistant, input);
     res.json(result);
   } catch (err) {
@@ -19,6 +19,7 @@ app.post("/healthAssistant", async (req, res) => {
     res.status(500).json({ error: (err as Error).message || "Internal Server Error" });
   }
 });
+
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
