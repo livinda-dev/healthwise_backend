@@ -45,7 +45,8 @@ Conversation so far:
 {conversation}
 """
 
-    model = genai.GenerativeModel("gemini-2.0-pro-exp")
+    model = genai.GenerativeModel("models/gemini-2.5-pro")
+
     result = model.generate_content(prompt)
 
     text = result.text if result else "Sorry, I could not generate response"
