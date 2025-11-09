@@ -48,7 +48,7 @@ Conversation so far:
     model = genai.GenerativeModel("models/gemini-2.5-pro")
 
     result = model.generate_content(prompt)
-print("GENAI RESULT:", result)
+    print("GENAI RESULT:", result)
 
 
     text = result.text if result else "Sorry, I could not generate response"
