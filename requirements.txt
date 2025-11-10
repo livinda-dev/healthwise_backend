@@ -3,3 +3,5 @@ uvicorn
 google-generativeai
 pydantic
 python-dotenv
+google-cloud-firestore
+google-auth
