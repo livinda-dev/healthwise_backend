@@ -5,3 +5,4 @@ pydantic
 python-dotenv
 google-cloud-firestore
 google-auth
+firebase-admin
