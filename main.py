@@ -230,7 +230,7 @@ Conversation so far:
 {convo}
 """
     try:
-        main_model = genai.GenerativeModel("models/gemini-2.5-pro")
+        main_model = genai.GenerativeModel("models/gemini-2.5-flash")
         main_result = main_model.generate_content(triage_prompt)
         reply_text = main_result.text or "I'm here to help. Could you share a bit more detail?"
     except Exception as e:
