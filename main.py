@@ -463,6 +463,54 @@ async def cleanup():
 
     return {"ok": True, "archived": moved}
 
+@app.post("/conditions/restore")
+async def restore_condition(body: DeleteHistoryBody):
+    user = body.userEmail.strip()
+    index = body.historyIndex
+    ref = db.collection(COLL).document(user)
+    snap = ref.get()
+    if not snap.exists:
+        return {"ok": False, "error": "User not found"}
+
+    state = snap.to_dict()
+    rb = state.get("recycle_bin", [])
+    hist = state.get("history", [])
+
+    if index < 0 or index >= len(rb):
+        return {"ok": False, "error": "Index out of range"}
+
+    item = rb.pop(index)
+    hist.append(item)
+
+    state["history"] = hist
+    state["recycle_bin"] = rb
+    ref.set(state)
+
+    return {"ok": True}
+
+
+@app.post("/conditions/deleteForever")
+async def delete_forever(body: DeleteHistoryBody):
+    user = body.userEmail.strip()
+    index = body.historyIndex
+    ref = db.collection(COLL).document(user)
+    snap = ref.get()
+    if not snap.exists:
+        return {"ok": False, "error": "User not found"}
+
+    state = snap.to_dict()
+    rb = state.get("recycle_bin", [])
+
+    if index < 0 or index >= len(rb):
+        return {"ok": False, "error": "Index out of range"}
+
+    rb.pop(index)
+    state["recycle_bin"] = rb
+    ref.set(state)
+
+    return {"ok": True}
+
+
 # ---------- RUN ----------
 if __name__ == "__main__":
     import uvicorn
