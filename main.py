@@ -272,6 +272,122 @@ User: \"{last_user}\"
 
     return {"text": reply}
 
+
+    # ---------- ROADMAP ENDPOINT ----------
+
+@app.get("/roadmap")
+async def get_roadmap(userEmail: str):
+    """
+    Return an AI-generated care roadmap for the user's active condition.
+    Shape:
+    {
+      "condition": {... or null},
+      "roadmap": [
+        {
+          "title": "Day 1 — ...",
+          "actions": ["...", "..."],
+          "warning": "..." or null
+        },
+        ...
+      ]
+    }
+    """
+    doc = db.collection(COLL).document(userEmail).get()
+    if not doc.exists:
+        return {"condition": None, "roadmap": []}
+
+    state = doc.to_dict()
+    active = state.get("active_condition")
+    symptoms = state.get("symptoms", {})
+
+    if not active:
+        # no current condition → no roadmap
+        return {"condition": None, "roadmap": []}
+
+    condition = (active.get("condition") or "health issue").lower()
+    severity = symptoms.get("severity")  # 1–10 or None
+    duration = symptoms.get("duration") or ""
+    other_symptoms = symptoms.get("otherSymptoms", [])
+
+    # ---- Build prompt for Gemini ----
+    prompt = f"""
+You are a careful medical triage assistant.
+
+Create a SIMPLE 1–3 day self-care plan ("care roadmap") for this user.
+Focus on lifestyle and home-care actions only (hydration, rest, screen time, posture, sleep, gentle activity, etc).
+Do NOT prescribe medication by name. You may say things like "over-the-counter pain relief if suitable for you" but keep it generic.
+
+User info:
+- Condition label: {condition}
+- Severity (1–10, if known): {severity}
+- Duration description: {duration}
+- Other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
+
+Rules:
+- Assume this is NOT an emergency (urgent red flags are handled elsewhere).
+- Plan horizon: 1–2 days if mild, up to 3 days if moderate.
+- For severity >= 7 or duration > 3 days, include a stronger warning to see a doctor.
+- For each day, give 3–6 short, practical actions (one sentence each).
+- Vary actions across days (not all identical).
+- Encourage hydration, adequate sleep, reduced stress, and reduced screen time where relevant.
+- Always remind that this is NOT a medical diagnosis.
+
+OUTPUT FORMAT:
+Return STRICT JSON ONLY. No explanation, no markdown, no commentary.
+Shape:
+{{
+  "roadmap": [
+    {{
+      "title": "Day 1 — Short title",
+      "actions": [
+        "Action 1 sentence.",
+        "Action 2 sentence.",
+        "Action 3 sentence."
+      ],
+      "warning": "Short warning sentence or null if no extra warning."
+    }},
+    ...
+  ]
+}}
+"""
+
+    try:
+        model = genai.GenerativeModel("models/gemini-2.5-pro")
+        res = model.generate_content(prompt)
+        text = (res.text or "").strip()
+
+        # clean ```json ... ``` if Gemini wraps it
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?", "", text).strip()
+            text = re.sub(r"```$", "", text).strip()
+
+        parsed = json.loads(text)
+        roadmap = parsed.get("roadmap", [])
+        # basic sanity check
+        if not isinstance(roadmap, list):
+            raise ValueError("roadmap is not a list")
+
+    except Exception as e:
+        # fallback minimal roadmap if AI fails
+        print("ROADMAP AI ERROR:", e)
+        roadmap = [
+            {
+                "title": "Day 1 — Self-care",
+                "actions": [
+                    "Drink water regularly during the day.",
+                    "Take breaks from screens and rest your eyes.",
+                    "Try to get enough sleep tonight.",
+                ],
+                "warning": "If your symptoms worsen or do not improve in a few days, please see a healthcare professional."
+            }
+        ]
+
+    return {
+        "condition": active,
+        "roadmap": roadmap,
+    }
+
+
 # ===================================================================
 # 🔥 USER CONDITION STATUS (New for your UI!)
 # ===================================================================
