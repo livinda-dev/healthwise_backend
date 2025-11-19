@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
 from fastapi import FastAPI, Request, Query
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
 # ---------- ENV ----------
@@ -64,24 +64,34 @@ class DeleteHistoryBody(BaseModel):
     userEmail: str
     historyIndex: int
 
+class RoadmapUpdateBody(BaseModel):
+    email: str
+    day: str
+    action: str
+    value: bool
+
+# ---------- Helpers ----------
+BAD_TERMS = [
+    "fuck","shit","bitch","suck my","dick","asshole","motherfucker","f*ck","f**k"
+]
+EMERGENCY_TERMS = [
+    "chest pain","pressure on chest","shortness of breath",
+    "trouble breathing","difficulty breathing","fainting","passed out",
+    "loss of consciousness","sudden weakness","sudden numbness","one-sided weakness",
+    "slurred speech","sudden vision loss","seizure","seizures",
+    "severe allergic reaction","anaphylaxis","suicidal","suicide",
+    "kill myself","overdose","bleeding that won't stop","uncontrolled bleeding"
+]
 UTC = timezone.utc
+
 def now_utc() -> datetime:
     return datetime.now(tz=UTC)
 
-# ---------- Toxicity Check ----------
-BAD_TERMS = [
-    "fuck", "shit", "bitch", "suck my", "dick",
-    "asshole", "motherfucker", "f*ck", "f**k"
-]
-
-EMERGENCY_TERMS = [
-    "chest pain","pressure on chest","shortness of breath",
-    "difficulty breathing","fainting","passed out",
-    "sudden weakness","sudden numbness","slurred speech",
-    "vision loss","seizure","seizures","suicidal",
-    "suicide","kill myself","overdose",
-    "bleeding that won't stop","uncontrolled bleeding"
-]
+def last_user_text(messages: List[Message]) -> str:
+    for m in reversed(messages):
+        if m.role == "user":
+            return " ".join(p.text for p in m.parts).strip()
+    return ""
 
 def is_direct_abuse(text: str) -> bool:
     lower = text.lower()
@@ -95,92 +105,112 @@ def has_emergency(text: str) -> Optional[str]:
             return k
     return None
 
-def greeting(text: str) -> bool:
-    return bool(re.search(r"\b(hi|hello|hey|good morning|good evening)\b", text.lower()))
-
-# ---------- Helpers ----------
-def last_user_text(messages: List[Message]) -> str:
-    for m in reversed(messages):
-        if m.role == "user":
-            return " ".join(p.text for p in m.parts).strip()
-    return ""
-
-def normalize_severity(val):
-    if val is None:
+def normalize_severity(value: Any) -> Optional[int]:
+    """
+    Ensure severity is an int 1–10, accepting:
+    - raw numbers (from Gemini)
+    - strings like "7/10" or "pain level 7"
+    """
+    if value is None:
         return None
-    if isinstance(val, (int, float)):
-        v = int(val)
+    if isinstance(value, (int, float)):
+        v = int(round(float(value)))
         return max(1, min(10, v))
-    m = re.search(r"(\d{1,2})", str(val))
+
+    s = str(value).lower()
+    # try "7/10" or "7"
+    m = re.search(r"(\d{1,2})\s*/\s*10", s) or re.search(r"\b(\d{1,2})\b", s)
     if m:
-        return max(1, min(10, int(m.group(1))))
+        try:
+            v = int(m.group(1))
+            return max(1, min(10, v))
+        except Exception:
+            pass
     return None
 
-def safe_list(x):
+def safe_list(x: Any) -> List[str]:
     if isinstance(x, list):
         return [str(i) for i in x if str(i).strip()]
     if isinstance(x, str) and x.strip():
         return [x.strip()]
     return []
 
-# ---------- Reminder Generator ----------
-def build_reminder_plan(condition: str):
+def greeting(text: str) -> bool:
+    # simple greeting detection
+    return bool(re.search(r"\b(hi|hello|hey|good\s+morning|good\s+evening)\b", text.lower()))
+
+# ---------- Reminder plan rules ----------
+def build_reminder_plan(condition: str) -> List[Dict[str, Any]]:
     t = now_utc()
-    if "headache" in condition.lower():
+    cond_lower = condition.lower()
+
+    if "headache" in cond_lower:
         return [
             {
-                "type": "water",
-                "title": "💧 Hydration check",
-                "body": "Drink some water.",
+                "type": "drink_water",
+                "title": "💧 Hydration break",
+                "body": "Drink a glass of water.",
                 "next_at": (t + timedelta(hours=2)).isoformat(),
-                "every_hours": 2
-            }
+                "every_hours": 2,
+            },
+            {
+                "type": "eye_rest",
+                "title": "👀 Eye rest",
+                "body": "Rest your eyes from screens for a few minutes.",
+                "next_at": (t + timedelta(hours=3)).isoformat(),
+                "every_hours": 3,
+            },
         ]
+
+    # default gentle plan
     return [
         {
             "type": "check_in",
-            "title": "🩺 Health check-in",
+            "title": "🩺 Quick check-in",
             "body": "How are you feeling now?",
             "next_at": (t + timedelta(hours=4)).isoformat(),
-            "every_hours": 4
+            "every_hours": 4,
         }
     ]
 
-def set_active_condition(state, condition, extracted):
+def set_active_condition(state: Dict[str, Any], condition: str, extracted: Dict[str, Any]):
     state["active_condition"] = {
         "condition": condition,
         "since": now_utc().isoformat(),
-        "extracted": extracted
+        "tips": ["Hydration", "Rest", "Avoid triggers"],
+        "extracted": extracted,
     }
     state["reminders"] = build_reminder_plan(condition)
+    state["stage"] = "reminder"  # after analysis, enter reminder loop
 
-# ===================================================================
-# ⚡️ MAIN CHAT ENDPOINT
-# ===================================================================
-
+# ---------- Core Chat Endpoint ----------
 @app.post("/healthAssistant")
 async def healthAssistant(req: Request):
     body = await req.json()
     raw = body.get("data") or body.get("input") or body
-    payload = InputData(**raw)
 
-    userEmail = payload.userEmail
+    # parse + validate
+    try:
+        payload = InputData(**raw)
+    except ValidationError as ve:
+        return {"text": f"Invalid input: {ve.errors()}"}
+
+    userEmail = payload.userEmail.strip()
+    if not userEmail:
+        return {"text": "Missing user email"}
+
     messages = payload.messages
     last_user = last_user_text(messages)
 
-    # ---------- Abuse Check ----------
-    if is_direct_abuse(last_user):
-        return {"text": "Please be respectful. I’m here to help you with your health."}
+    # profanity rule
+    if last_user and is_direct_abuse(last_user):
+        return {
+            "text": "Please speak respectfully. I'm here to help you with your health."
+        }
 
-    # ---------- Emergency Rule ----------
-    danger = has_emergency(last_user)
-    if danger:
-        return {"text": f"⚠️ This seems serious (“{danger}”). Please seek emergency care immediately."}
-
-    # ---------- Load State ----------
+    # load or create state
     doc_ref = db.collection(COLL).document(userEmail)
     snap = doc_ref.get()
-
     if snap.exists:
         state = snap.to_dict()
     else:
@@ -190,440 +220,447 @@ async def healthAssistant(req: Request):
                 "location": None,
                 "duration": None,
                 "severity": None,
-                "otherSymptoms": []
+                "otherSymptoms": [],
             },
             "history": [],
-            "recycle_bin": []
+            "recycle_bin": [],
+            "roadmap_progress": {},
         }
 
-    # ---------- If user says hi → reset triage but keep history ----------
-    if greeting(last_user) and state.get("stage") == "analysis":
+    # reset if user greets while stage is finished/analysis
+    if state.get("stage") in ("analysis", "reminder") and greeting(last_user):
         state["stage"] = "intake"
-        state["symptoms"] = {"location": None, "duration": None, "severity": None, "otherSymptoms": []}
+        state["symptoms"] = {
+            "location": None,
+            "duration": None,
+            "severity": None,
+            "otherSymptoms": [],
+        }
         state.pop("active_condition", None)
         state.pop("reminders", None)
         doc_ref.set(state)
 
-    # ---------- AI Triage Prompt ----------
-    symp = state["symptoms"]
-    convo = "\n".join([f"{m.role}: {' '.join(p.text for p in m.parts)}" for m in messages])
+    # emergency shortcut
+    danger = has_emergency(last_user)
+    if danger:
+        state["stage"] = "emergency"
+        doc_ref.set(state)
+        return {
+            "text": f"⚠️ Your message suggests a serious symptom (\"{danger}\"). "
+                    "Please seek urgent medical care now or call your local emergency number."
+        }
 
-    prompt = f"""
-You are a medical triage assistant. Ask 1–3 short follow-up questions first.
-Keep responses short. No diagnosis. Give advice only after enough info.
+    # build conversation string
+    convo = ""
+    for m in messages:
+        convo += f"{m.role}: {' '.join(p.text for p in m.parts)}\n"
 
-Current triage stage: {state.get("stage")}
-Known symptoms: {json.dumps(symp)}
+    symp = state.get("symptoms", {})
+    missing = []
+    if not symp.get("location"):
+        missing.append("location (e.g., left side of head, chest, etc.)")
+    if not symp.get("duration"):
+        missing.append("duration (e.g., since yesterday, 2 hours)")
+    if not symp.get("severity"):
+        missing.append("severity (1–10)")
 
-Conversation:
+    missing_hint = ""
+    if missing:
+        missing_hint = "- Ask about: " + "; ".join(missing) + "."
+
+    # main triage prompt
+    triage_prompt = f"""
+You are an empathetic medical triage assistant AI.
+
+Your job:
+- Act like a doctor doing initial triage.
+- Ask 1–3 follow-up questions FIRST; only give suggestions after enough info.
+- Keep messages short and clear.
+- Ignore mild profanity inside symptom description; only ask for respectful tone if user directly insults you.
+- Always remind this is NOT a formal medical diagnosis.
+
+Triage stage: {state.get("stage", "intake")}
+Known symptoms (may be incomplete): {json.dumps(symp, ensure_ascii=False)}
+{missing_hint}
+
+If red flags (chest pain, trouble breathing, sudden weakness/numbness, vision loss, fainting, severe allergy, suicidal thoughts) appear, advise urgent care.
+
+Continue the conversation in the user's language.
+
+Conversation so far:
 {convo}
 """
 
     try:
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
-        result = model.generate_content(prompt)
-        reply = result.text
-    except:
-        reply = "I'm here to help. Could you tell me more?"
+        main_model = genai.GenerativeModel("models/gemini-2.5-flash")
+        main_result = main_model.generate_content(triage_prompt)
+        reply_text = main_result.text or "I'm here to help. Could you share a bit more detail?"
+    except Exception as e:
+        reply_text = f"Sorry, I had trouble generating a response. ({e})"
 
-    # ---------- Extraction Pass ----------
-    extracted = {}
-    condition_label = None
+    # ---------- MULTILINGUAL EXTRACTION PASS ----------
+    condition_label: Optional[str] = None
+
     if last_user:
-        eprompt = f"""
-Extract JSON with:
-location, duration, severity (1–10), otherSymptoms[], condition
+        extract_prompt = f"""
+You extract health triage information from ANY LANGUAGE (including Khmer).
 
-User: \"{last_user}\"
+Always return STRICT JSON ONLY, like:
+{{
+  "location": string or null,
+  "duration": string or null,
+  "severity": number or null,
+  "otherSymptoms": [string, ...],
+  "condition": string or null
+}}
+
+Interpret severity even if described in non-English words. Map to 1–10:
+- very mild / "ឈឺតិចៗ" ≈ 2
+- mild / "ឈឺតិច" ≈ 3
+- moderate / "មធ្យម" ≈ 5
+- quite strong / "ឈឺខ្លាំង" ≈ 7
+- very strong / "ខ្លាំងណាស់" ≈ 8–9
+
+If the text clearly describes strong pain, choose a higher number. If unsure, guess a reasonable 1–10.
+
+User message:
+\"\"\"{last_user}\"\"\"
 """
         try:
-            m2 = genai.GenerativeModel("models/gemini-2.0-flash")
-            raw = m2.generate_content(eprompt).text.strip()
-            raw = raw.replace("```json", "").replace("```", "")
-            extracted = json.loads(raw)
+            fast_model = genai.GenerativeModel("models/gemini-2.0-flash")
+            er = fast_model.generate_content(extract_prompt)
+            cleaned = (er.text or "{}").strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+                cleaned = re.sub(r"```$", "", cleaned).strip()
+            extracted = json.loads(cleaned)
 
-            if extracted.get("location"):
-                state["symptoms"]["location"] = extracted["location"]
-            if extracted.get("duration"):
-                state["symptoms"]["duration"] = extracted["duration"]
-            if extracted.get("severity") is not None:
-                state["symptoms"]["severity"] = normalize_severity(extracted["severity"])
-            if extracted.get("otherSymptoms"):
-                exist = set(state["symptoms"].get("otherSymptoms", []))
-                for s in extracted["otherSymptoms"]:
-                    exist.add(s)
-                state["symptoms"]["otherSymptoms"] = list(exist)
+            loc = extracted.get("location")
+            dur = extracted.get("duration")
+            sev = normalize_severity(extracted.get("severity"))
+            oth = safe_list(extracted.get("otherSymptoms"))
+            condition_label = (extracted.get("condition") or "").strip()[:64]
 
-            condition_label = extracted.get("condition")
-        except:
+            # update state
+            if loc:
+                state["symptoms"]["location"] = loc
+            if dur:
+                state["symptoms"]["duration"] = dur
+            if sev:
+                state["symptoms"]["severity"] = sev
+            if oth:
+                cur = set(state["symptoms"].get("otherSymptoms", []))
+                for x in oth:
+                    if x not in cur:
+                        cur.add(x)
+                state["symptoms"]["otherSymptoms"] = list(cur)
+        except Exception:
+            # extraction failure is non-fatal
             pass
 
-    # ---------- Move to analysis ----------
-    s = state["symptoms"]
-    if s["location"] and s["duration"] and s["severity"]:
+    # move to analysis when core fields are known
+    symp = state["symptoms"]
+    if symp.get("location") and symp.get("duration") and symp.get("severity"):
         state["stage"] = "analysis"
 
-    # ---------- Attach condition ----------
-    if state["stage"] == "analysis" and condition_label and not state.get("active_condition"):
-        set_active_condition(state, condition_label, extracted)
+    # start reminders when we have a condition and just reached analysis
+    if state.get("stage") == "analysis" and condition_label and not state.get("active_condition"):
+        set_active_condition(state, condition_label, state["symptoms"])
 
-    # ---------- Save ----------
+    # save state
     doc_ref.set(state)
+    return {"text": reply_text}
 
-    return {"text": reply}
+# ---------- Register FCM token ----------
+@app.post("/registerToken")
+async def register_token(body: RegisterTokenBody):
+    user_id = body.userEmail.strip()
+    if not user_id:
+        return {"ok": False, "error": "Missing email"}
 
+    db.collection(TOKENS).document(user_id).set(
+        {"token": body.fcmToken, "updated_at": now_utc().isoformat()}
+    )
+    return {"ok": True}
 
-    # ---------- ROADMAP ENDPOINT ----------
+# ---------- Resolve current condition ----------
+@app.post("/conditions/resolve")
+async def resolve_condition(body: ResolveBody):
+    user = body.userEmail.strip()
+    ref = db.collection(COLL).document(user)
+    snap = ref.get()
+    if not snap.exists:
+        return {"ok": True}
 
+    state = snap.to_dict()
+    ac = state.get("active_condition")
+    if ac:
+        item = {
+            "condition": ac.get("condition"),
+            "resolved": now_utc().isoformat(),
+            "duration": state["symptoms"].get("duration"),
+            "severity": state["symptoms"].get("severity"),
+            "note": body.note or "",
+        }
+        hist = state.get("history", [])
+        hist.append(item)
+        state["history"] = hist
+
+        # clear active condition + reminders + symptoms
+        state.pop("active_condition", None)
+        state.pop("reminders", None)
+        state["stage"] = "intake"
+        state["symptoms"] = {
+            "location": None,
+            "duration": None,
+            "severity": None,
+            "otherSymptoms": [],
+        }
+        ref.set(state)
+
+    return {"ok": True}
+
+# ---------- Delete a history item -> recycle_bin ----------
+@app.post("/conditions/delete")
+async def delete_history_item(body: DeleteHistoryBody):
+    user = body.userEmail.strip()
+    ref = db.collection(COLL).document(user)
+    snap = ref.get()
+    if not snap.exists:
+        return {"ok": False, "error": "no user state"}
+
+    state = snap.to_dict()
+    hist = state.get("history", [])
+    if body.historyIndex < 0 or body.historyIndex >= len(hist):
+        return {"ok": False, "error": "index out of range"}
+
+    item = hist.pop(body.historyIndex)
+    rb = state.get("recycle_bin", [])
+    item["deleted_at"] = now_utc().isoformat()
+    rb.append(item)
+
+    state["history"] = hist
+    state["recycle_bin"] = rb
+    ref.set(state)
+    return {"ok": True}
+
+# ---------- Reset all (dev helper) ----------
+@app.post("/conditions/reset")
+async def reset_all(body: ResolveBody):
+    user = body.userEmail.strip()
+    ref = db.collection(COLL).document(user)
+    ref.set(
+        {
+            "stage": "intake",
+            "symptoms": {
+                "location": None,
+                "duration": None,
+                "severity": None,
+                "otherSymptoms": [],
+            },
+            "history": [],
+            "recycle_bin": [],
+            "roadmap_progress": {},
+        }
+    )
+    return {"ok": True}
+
+# ---------- DEBUG: get state ----------
+@app.get("/state")
+async def get_state(userEmail: str = Query(...)):
+    snap = db.collection(COLL).document(userEmail).get()
+    return snap.to_dict() if snap.exists else {}
+
+# ---------- ROADMAP: AI-generated care plan ----------
 @app.get("/roadmap")
 async def get_roadmap(userEmail: str):
-    """
-    Return AI-generated roadmap + existing progress.
-    {
-      "condition": {...} or null,
-      "roadmap": [...],
-      "progress": {...}
-    }
-    """
-
     doc = db.collection(COLL).document(userEmail).get()
     if not doc.exists:
         return {"condition": None, "roadmap": [], "progress": {}}
 
     state = doc.to_dict()
     active = state.get("active_condition")
-    symptoms = state.get("symptoms", {})
     progress = state.get("roadmap_progress", {})
 
-    # If no active condition → no roadmap
     if not active:
         return {"condition": None, "roadmap": [], "progress": progress}
 
+    symptoms = state.get("symptoms", {})
     condition = (active.get("condition") or "health issue").lower()
     severity = symptoms.get("severity")
     duration = symptoms.get("duration") or ""
     other_symptoms = symptoms.get("otherSymptoms", [])
 
-    # ---------------------------
-    # Build AI prompt
-    # ---------------------------
     prompt = f"""
 You are a careful medical triage assistant.
 
 Create a SIMPLE 1–3 day self-care plan ("care roadmap") for this user.
-Focus only on lifestyle and home-care: hydration, rest, screen time, posture, stretching, sleep, gentle activity etc.
-NEVER prescribe medication by name.
+Focus on lifestyle and home-care actions only (hydration, rest, screen time, posture, sleep, gentle activity, etc).
+Do NOT prescribe medication by name. You may say generic phrases like
+"over-the-counter pain relief if suitable for you", but no specific drug names.
 
-User Info:
-- Condition: {condition}
-- Severity (1–10): {severity}
-- Duration: {duration}
+User info:
+- Condition label: {condition}
+- Severity (1–10, if known): {severity}
+- Duration description: {duration}
 - Other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
 
 Rules:
-- Assume this is NOT an emergency.
-- Mild cases: 1–2 days.
-- Moderate cases: 2–3 days.
-- If severity ≥ 7 OR duration > 3 days → include short warning.
+- Assume this is NOT an emergency (urgent red flags are handled elsewhere).
+- Plan horizon: 1–2 days if mild, up to 3 days if moderate.
+- For severity >= 7 or duration > 3 days, include a stronger warning to see a doctor.
 - For each day, give 3–6 short, practical actions (one sentence each).
 - Each action MUST START with a time label (e.g. "09:00", "14:30", or "9am") followed by a space, then the action.
   Example: "09:00 Drink a glass of water."
-- Encourage hydration, rest, screen moderation, posture, stress reduction.
-- Always remind this is NOT a medical diagnosis.
+- Vary actions across days (not all identical).
+- Encourage hydration, adequate sleep, reduced stress, and reduced screen time where relevant.
+- Always remind that this is NOT a medical diagnosis.
 
-OUTPUT STRICT JSON ONLY:
-{
+OUTPUT FORMAT:
+Return STRICT JSON ONLY. No explanation, no markdown.
+
+{{
   "roadmap": [
-    {
+    {{
       "title": "Day 1 — Short title",
       "actions": [
-        "Action 1.",
-        "Action 2."
+        "09:00 Action 1 sentence.",
+        "13:00 Action 2 sentence."
       ],
-      "warning": "Short warning or null"
-    }
+      "warning": "Short warning sentence or null."
+    }},
+    ...
   ]
-}
+}}
 """
 
-    # ---------------------------
-    # Call Gemini
-    # ---------------------------
     try:
         model = genai.GenerativeModel("models/gemini-2.5-pro")
         res = model.generate_content(prompt)
         text = (res.text or "").strip()
-
-        # remove ```json wrappers
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?", "", text).strip()
             text = re.sub(r"```$", "", text).strip()
-
         parsed = json.loads(text)
         roadmap = parsed.get("roadmap", [])
-
         if not isinstance(roadmap, list):
-            raise ValueError("roadmap must be a list")
-
+            raise ValueError("roadmap is not a list")
     except Exception as e:
         print("ROADMAP AI ERROR:", e)
         roadmap = [
             {
-                "title": "Day 1 — Basic Care",
+                "title": "Day 1 — Self-care",
                 "actions": [
-                    "Drink water regularly.",
-                    "Reduce screen time today.",
-                    "Get enough sleep tonight."
+                    "09:00 Drink water regularly during the day.",
+                    "13:00 Take breaks from screens and rest your eyes.",
+                    "22:00 Try to get enough sleep tonight.",
                 ],
-                "warning": "If symptoms do not improve in a few days, consider seeing a doctor."
+                "warning": "If your symptoms worsen or do not improve in a few days, please see a healthcare professional.",
             }
         ]
 
-    # ---------------------------
-    # Build progress structure
-    # ---------------------------
-    for day in roadmap:
-        title = day["title"]
-        progress.setdefault(title, {})
-        for act in day["actions"]:
-            progress[title].setdefault(act, False)
+    return {"condition": active, "roadmap": roadmap, "progress": progress}
 
-    # Save updated progress
-    db.collection(COLL).document(userEmail).update({
-        "roadmap_progress": progress
-    })
-
-    return {
-        "condition": active,
-        "roadmap": roadmap,
-        "progress": progress
-    }
-
-
-@app.get("/cron/roadmapReminders")
-async def cron_roadmap_reminders():
-    now = now_utc()
-    users = db.collection(COLL).stream()
-    sent = 0
-
-    for doc in users:
-        email = doc.id
-        state = doc.to_dict()
-        active = state.get("active_condition")
-        progress = state.get("roadmap_progress", {})
-
-        if not active:
-            continue
-
-        # find unfinished actions
-        for day, acts in progress.items():
-            for act, done in acts.items():
-                if not done:  # action incomplete
-                    # send reminder
-                    tok_snap = db.collection(TOKENS).document(email).get()
-                    if not tok_snap.exists:
-                        continue
-                    token = tok_snap.to_dict().get("token")
-
-                    try:
-                        messaging.send(messaging.Message(
-                            token=token,
-                            notification=messaging.Notification(
-                                title=f"Care step remaining",
-                                body=f"Don't forget: {act}",
-                            )
-                        ))
-                        sent += 1
-                    except Exception:
-                        pass
-
-    return {"ok": True, "sent": sent}
-
-
-
-
-# ===================================================================
-# 🔥 USER CONDITION STATUS (New for your UI!)
-# ===================================================================
-
-@app.get("/conditions/status/{email}")
-async def condition_status(email: str):
-    snap = db.collection(COLL).document(email).get()
-    if not snap.exists:
-        return {"active": False}
-
-    st = snap.to_dict()
-    return {"active": bool(st.get("active_condition"))}
-
-# ===================================================================
-# FCM TOKEN REGISTER
-# ===================================================================
-
-@app.post("/registerToken")
-async def register_token(body: RegisterTokenBody):
-    db.collection(TOKENS).document(body.userEmail).set({
-        "token": body.fcmToken,
-        "updated_at": now_utc().isoformat()
-    })
-    return {"ok": True}
-
-# ===================================================================
-# USER SAYS "I'M BETTER NOW"
-# ===================================================================
-
-@app.post("/conditions/resolve")
-async def resolve_condition(body: ResolveBody):
-    user = body.userEmail
+# ---------- ROADMAP: update checkbox progress ----------
+@app.post("/roadmap/update")
+async def update_roadmap_progress(body: RoadmapUpdateBody):
+    user = body.email.strip()
     ref = db.collection(COLL).document(user)
     snap = ref.get()
-
     if not snap.exists:
-        return {"ok": True}
+        return {"ok": False, "error": "no user state"}
 
-    st = snap.to_dict()
-    ac = st.get("active_condition")
-    if not ac:
-        return {"ok": True}
+    state = snap.to_dict()
+    progress = state.get("roadmap_progress", {})
 
-    # store in history
-    item = {
-        "condition": ac.get("condition"),
-        "resolved": now_utc().isoformat(),
-        "severity": st["symptoms"].get("severity"),
-        "duration": st["symptoms"].get("duration"),
-        "note": body.note or ""
-    }
+    day_map = progress.get(body.day, {})
+    if not isinstance(day_map, dict):
+        day_map = {}
+    day_map[body.action] = body.value
+    progress[body.day] = day_map
 
-    hist = st.get("history", [])
-    hist.append(item)
-    st["history"] = hist
-
-    # reset triage
-    st.pop("active_condition", None)
-    st.pop("reminders", None)
-
-    st["stage"] = "intake"
-    st["symptoms"] = {"location": None, "duration": None, "severity": None, "otherSymptoms": []}
-
-    ref.set(st)
-
+    state["roadmap_progress"] = progress
+    ref.set(state)
     return {"ok": True}
 
-# ===================================================================
-# DELETE HISTORY (Soft delete → recycle_bin)
-# ===================================================================
-
-@app.post("/conditions/delete")
-async def delete_history_item(body: DeleteHistoryBody):
-    user = body.userEmail
-    ref = db.collection(COLL).document(user)
-    snap = ref.get()
-
-    if not snap.exists:
-        return {"ok": False}
-
-    st = snap.to_dict()
-    hist = st.get("history", [])
-    if body.historyIndex < 0 or body.historyIndex >= len(hist):
-        return {"ok": False}
-
-    item = hist.pop(body.historyIndex)
-    item["deleted_at"] = now_utc().isoformat()
-
-    rb = st.get("recycle_bin", [])
-    rb.append(item)
-
-    st["history"] = hist
-    st["recycle_bin"] = rb
-
-    ref.set(st)
-    return {"ok": True}
-
-# ===================================================================
-# DEBUG: GET RAW STATE
-# ===================================================================
-
-@app.get("/state")
-async def get_state(userEmail: str = Query(...)):
-    snap = db.collection(COLL).document(userEmail).get()
-    return snap.to_dict() if snap.exists else {}
-
-# ===================================================================
-# CRON JOBS
-# ===================================================================
-
+# ---------- CRON: send due reminders ----------
 @app.get("/cron/dispatchReminders")
 async def cron_dispatch():
-    now = now_utc()
     sent = 0
-
+    now = now_utc()
     users = db.collection(COLL).stream()
     for doc in users:
         uid = doc.id
         st = doc.to_dict()
-
-        if "active_condition" not in st:
-            continue
-
+        ac = st.get("active_condition")
         rems = st.get("reminders", [])
-        if not rems:
+        if not ac or not rems:
             continue
 
-        tok = db.collection(TOKENS).document(uid).get()
-        if not tok.exists:
+        tok_snap = db.collection(TOKENS).document(uid).get()
+        if not tok_snap.exists:
             continue
-
-        token = tok.to_dict().get("token")
+        token = tok_snap.to_dict().get("token")
         if not token:
             continue
 
-        changed = False
+        updated = False
         for r in rems:
             due = datetime.fromisoformat(r["next_at"])
             if due <= now:
                 try:
-                    messaging.send(messaging.Message(
-                        notification=messaging.Notification(
-                            title=r["title"],
-                            body=r["body"]
-                        ),
-                        token=token
-                    ))
+                    messaging.send(
+                        messaging.Message(
+                            notification=messaging.Notification(
+                                title=r.get("title", "Health reminder"),
+                                body=r.get("body", "How are you feeling?"),
+                            ),
+                            token=token,
+                        )
+                    )
                     sent += 1
-                except:
+                except Exception:
                     pass
 
-                r["next_at"] = (now + timedelta(hours=r["every_hours"])).isoformat()
-                changed = True
+                interval = int(r.get("every_hours", 4))
+                r["next_at"] = (now + timedelta(hours=interval)).isoformat()
+                updated = True
 
-        if changed:
+        if updated:
             db.collection(COLL).document(uid).update({"reminders": rems})
 
     return {"ok": True, "sent": sent}
 
+# ---------- CRON: cleanup recycle bin -> anonymous archive after 30d ----------
 @app.get("/cron/cleanupRecycleBin")
-async def cleanup():
-    cutoff = now_utc() - timedelta(days=30)
+async def cron_cleanup():
     moved = 0
-
+    cutoff = now_utc() - timedelta(days=30)
     for doc in db.collection(COLL).stream():
         uid = doc.id
         st = doc.to_dict()
-
         rb = st.get("recycle_bin", [])
         keep = []
-
         for item in rb:
-            dt = datetime.fromisoformat(item["deleted_at"])
+            try:
+                dt = datetime.fromisoformat(item["deleted_at"])
+            except Exception:
+                keep.append(item)
+                continue
+
             if dt <= cutoff:
-                anon_id = hashlib.sha256(f"{uid}:{item.get('condition')}".encode()).hexdigest()
-                db.collection(ANON_ARCHIVE).document(anon_id).set({
-                    "condition": item.get("condition"),
-                    "severity": item.get("severity"),
-                    "duration": item.get("duration"),
-                    "resolved": item.get("resolved"),
-                    "archived_at": now_utc().isoformat(),
-                })
+                anon_id = hashlib.sha256(
+                    f"{uid}:{item.get('condition','')}:{item.get('resolved','')}".encode()
+                ).hexdigest()
+                db.collection(ANON_ARCHIVE).document(anon_id).set(
+                    {
+                        "condition": item.get("condition"),
+                        "resolved": item.get("resolved"),
+                        "severity": item.get("severity"),
+                        "duration": item.get("duration"),
+                        "archived_at": now_utc().isoformat(),
+                    }
+                )
                 moved += 1
             else:
                 keep.append(item)
@@ -633,55 +670,8 @@ async def cleanup():
 
     return {"ok": True, "archived": moved}
 
-@app.post("/conditions/restore")
-async def restore_condition(body: DeleteHistoryBody):
-    user = body.userEmail.strip()
-    index = body.historyIndex
-    ref = db.collection(COLL).document(user)
-    snap = ref.get()
-    if not snap.exists:
-        return {"ok": False, "error": "User not found"}
-
-    state = snap.to_dict()
-    rb = state.get("recycle_bin", [])
-    hist = state.get("history", [])
-
-    if index < 0 or index >= len(rb):
-        return {"ok": False, "error": "Index out of range"}
-
-    item = rb.pop(index)
-    hist.append(item)
-
-    state["history"] = hist
-    state["recycle_bin"] = rb
-    ref.set(state)
-
-    return {"ok": True}
-
-
-@app.post("/conditions/deleteForever")
-async def delete_forever(body: DeleteHistoryBody):
-    user = body.userEmail.strip()
-    index = body.historyIndex
-    ref = db.collection(COLL).document(user)
-    snap = ref.get()
-    if not snap.exists:
-        return {"ok": False, "error": "User not found"}
-
-    state = snap.to_dict()
-    rb = state.get("recycle_bin", [])
-
-    if index < 0 or index >= len(rb):
-        return {"ok": False, "error": "Index out of range"}
-
-    rb.pop(index)
-    state["recycle_bin"] = rb
-    ref.set(state)
-
-    return {"ok": True}
-
-
-# ---------- RUN ----------
+# ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
