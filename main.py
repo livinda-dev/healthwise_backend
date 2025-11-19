@@ -278,114 +278,166 @@ User: \"{last_user}\"
 @app.get("/roadmap")
 async def get_roadmap(userEmail: str):
     """
-    Return an AI-generated care roadmap for the user's active condition.
-    Shape:
+    Return AI-generated roadmap + existing progress.
     {
-      "condition": {... or null},
-      "roadmap": [
-        {
-          "title": "Day 1 — ...",
-          "actions": ["...", "..."],
-          "warning": "..." or null
-        },
-        ...
-      ]
+      "condition": {...} or null,
+      "roadmap": [...],
+      "progress": {...}
     }
     """
+
     doc = db.collection(COLL).document(userEmail).get()
     if not doc.exists:
-        return {"condition": None, "roadmap": []}
+        return {"condition": None, "roadmap": [], "progress": {}}
 
     state = doc.to_dict()
     active = state.get("active_condition")
     symptoms = state.get("symptoms", {})
+    progress = state.get("roadmap_progress", {})
 
+    # If no active condition → no roadmap
     if not active:
-        # no current condition → no roadmap
-        return {"condition": None, "roadmap": []}
+        return {"condition": None, "roadmap": [], "progress": progress}
 
     condition = (active.get("condition") or "health issue").lower()
-    severity = symptoms.get("severity")  # 1–10 or None
+    severity = symptoms.get("severity")
     duration = symptoms.get("duration") or ""
     other_symptoms = symptoms.get("otherSymptoms", [])
 
-    # ---- Build prompt for Gemini ----
+    # ---------------------------
+    # Build AI prompt
+    # ---------------------------
     prompt = f"""
 You are a careful medical triage assistant.
 
 Create a SIMPLE 1–3 day self-care plan ("care roadmap") for this user.
-Focus on lifestyle and home-care actions only (hydration, rest, screen time, posture, sleep, gentle activity, etc).
-Do NOT prescribe medication by name. You may say things like "over-the-counter pain relief if suitable for you" but keep it generic.
+Focus only on lifestyle and home-care: hydration, rest, screen time, posture, stretching, sleep, gentle activity etc.
+NEVER prescribe medication by name.
 
-User info:
-- Condition label: {condition}
-- Severity (1–10, if known): {severity}
-- Duration description: {duration}
+User Info:
+- Condition: {condition}
+- Severity (1–10): {severity}
+- Duration: {duration}
 - Other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
 
 Rules:
-- Assume this is NOT an emergency (urgent red flags are handled elsewhere).
-- Plan horizon: 1–2 days if mild, up to 3 days if moderate.
-- For severity >= 7 or duration > 3 days, include a stronger warning to see a doctor.
-- For each day, give 3–6 short, practical actions (one sentence each).
-- Vary actions across days (not all identical).
-- Encourage hydration, adequate sleep, reduced stress, and reduced screen time where relevant.
-- Always remind that this is NOT a medical diagnosis.
+- Assume this is NOT an emergency.
+- Mild cases: 1–2 days.
+- Moderate cases: 2–3 days.
+- If severity ≥ 7 OR duration > 3 days → include short warning.
+- Each day: 3–6 short actions.
+- Encourage hydration, rest, screen moderation, posture, stress reduction.
+- Always remind this is NOT a medical diagnosis.
 
-OUTPUT FORMAT:
-Return STRICT JSON ONLY. No explanation, no markdown, no commentary.
-Shape:
-{{
+OUTPUT STRICT JSON ONLY:
+{
   "roadmap": [
-    {{
+    {
       "title": "Day 1 — Short title",
       "actions": [
-        "Action 1 sentence.",
-        "Action 2 sentence.",
-        "Action 3 sentence."
+        "Action 1.",
+        "Action 2."
       ],
-      "warning": "Short warning sentence or null if no extra warning."
-    }},
-    ...
+      "warning": "Short warning or null"
+    }
   ]
-}}
+}
 """
 
+    # ---------------------------
+    # Call Gemini
+    # ---------------------------
     try:
         model = genai.GenerativeModel("models/gemini-2.5-pro")
         res = model.generate_content(prompt)
         text = (res.text or "").strip()
 
-        # clean ```json ... ``` if Gemini wraps it
+        # remove ```json wrappers
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?", "", text).strip()
             text = re.sub(r"```$", "", text).strip()
 
         parsed = json.loads(text)
         roadmap = parsed.get("roadmap", [])
-        # basic sanity check
+
         if not isinstance(roadmap, list):
-            raise ValueError("roadmap is not a list")
+            raise ValueError("roadmap must be a list")
 
     except Exception as e:
-        # fallback minimal roadmap if AI fails
         print("ROADMAP AI ERROR:", e)
         roadmap = [
             {
-                "title": "Day 1 — Self-care",
+                "title": "Day 1 — Basic Care",
                 "actions": [
-                    "Drink water regularly during the day.",
-                    "Take breaks from screens and rest your eyes.",
-                    "Try to get enough sleep tonight.",
+                    "Drink water regularly.",
+                    "Reduce screen time today.",
+                    "Get enough sleep tonight."
                 ],
-                "warning": "If your symptoms worsen or do not improve in a few days, please see a healthcare professional."
+                "warning": "If symptoms do not improve in a few days, consider seeing a doctor."
             }
         ]
+
+    # ---------------------------
+    # Build progress structure
+    # ---------------------------
+    for day in roadmap:
+        title = day["title"]
+        progress.setdefault(title, {})
+        for act in day["actions"]:
+            progress[title].setdefault(act, False)
+
+    # Save updated progress
+    db.collection(COLL).document(userEmail).update({
+        "roadmap_progress": progress
+    })
 
     return {
         "condition": active,
         "roadmap": roadmap,
+        "progress": progress
     }
+
+
+@app.get("/cron/roadmapReminders")
+async def cron_roadmap_reminders():
+    now = now_utc()
+    users = db.collection(COLL).stream()
+    sent = 0
+
+    for doc in users:
+        email = doc.id
+        state = doc.to_dict()
+        active = state.get("active_condition")
+        progress = state.get("roadmap_progress", {})
+
+        if not active:
+            continue
+
+        # find unfinished actions
+        for day, acts in progress.items():
+            for act, done in acts.items():
+                if not done:  # action incomplete
+                    # send reminder
+                    tok_snap = db.collection(TOKENS).document(email).get()
+                    if not tok_snap.exists:
+                        continue
+                    token = tok_snap.to_dict().get("token")
+
+                    try:
+                        messaging.send(messaging.Message(
+                            token=token,
+                            notification=messaging.Notification(
+                                title=f"Care step remaining",
+                                body=f"Don't forget: {act}",
+                            )
+                        ))
+                        sent += 1
+                    except Exception:
+                        pass
+
+    return {"ok": True, "sent": sent}
+
+
 
 
 # ===================================================================
