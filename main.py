@@ -325,7 +325,9 @@ Rules:
 - Mild cases: 1–2 days.
 - Moderate cases: 2–3 days.
 - If severity ≥ 7 OR duration > 3 days → include short warning.
-- Each day: 3–6 short actions.
+- For each day, give 3–6 short, practical actions (one sentence each).
+- Each action MUST START with a time label (e.g. "09:00", "14:30", or "9am") followed by a space, then the action.
+  Example: "09:00 Drink a glass of water."
 - Encourage hydration, rest, screen moderation, posture, stress reduction.
 - Always remind this is NOT a medical diagnosis.
 
