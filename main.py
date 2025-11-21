@@ -471,65 +471,55 @@ async def get_state(userEmail: str = Query(...)):
     snap = db.collection(COLL).document(userEmail).get()
     return snap.to_dict() if snap.exists else {}
 
-# ---------- ROADMAP: AI-generated care plan ----------
 @app.get("/roadmap")
 async def get_roadmap(userEmail: str):
-    doc = db.collection(COLL).document(userEmail).get()
-    if not doc.exists:
+    """Return cached roadmap or generate and save it once."""
+    doc_ref = db.collection(COLL).document(userEmail)
+    snap = doc_ref.get()
+
+    if not snap.exists:
         return {"condition": None, "roadmap": [], "progress": {}}
 
-    state = doc.to_dict()
+    state = snap.to_dict()
     active = state.get("active_condition")
+    symptoms = state.get("symptoms", {})
     progress = state.get("roadmap_progress", {})
 
+    # No active condition → No roadmap
     if not active:
         return {"condition": None, "roadmap": [], "progress": progress}
 
-    symptoms = state.get("symptoms", {})
+    # If roadmap already cached → return it
+    saved = state.get("saved_roadmap")
+    if saved:
+        return {"condition": active, "roadmap": saved, "progress": progress}
+
+    # ---- Otherwise generate NEW roadmap once ----
     condition = (active.get("condition") or "health issue").lower()
     severity = symptoms.get("severity")
     duration = symptoms.get("duration") or ""
     other_symptoms = symptoms.get("otherSymptoms", [])
 
     prompt = f"""
-You are a careful medical triage assistant.
-
-Create a SIMPLE 1–3 day self-care plan ("care roadmap") for this user.
-Focus on lifestyle and home-care actions only (hydration, rest, screen time, posture, sleep, gentle activity, etc).
-Do NOT prescribe medication by name. You may say generic phrases like
-"over-the-counter pain relief if suitable for you", but no specific drug names.
-
-User info:
-- Condition label: {condition}
-- Severity (1–10, if known): {severity}
-- Duration description: {duration}
-- Other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
+Create a 1–3 day care roadmap for:
+- condition: {condition}
+- severity: {severity}
+- duration: {duration}
+- other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
 
 Rules:
-- Assume this is NOT an emergency (urgent red flags are handled elsewhere).
-- Plan horizon: 1–2 days if mild, up to 3 days if moderate.
-- For severity >= 7 or duration > 3 days, include a stronger warning to see a doctor.
-- For each day, give 3–6 short, practical actions (one sentence each).
-- Each action MUST START with a time label (e.g. "09:00", "14:30", or "9am") followed by a space, then the action.
-  Example: "09:00 Drink a glass of water."
-- Vary actions across days (not all identical).
-- Encourage hydration, adequate sleep, reduced stress, and reduced screen time where relevant.
-- Always remind that this is NOT a medical diagnosis.
-
-OUTPUT FORMAT:
-Return STRICT JSON ONLY. No explanation, no markdown.
-
+- 3–6 steps per day
+- No medical prescriptions (generic terms ok)
+- Include short warning for high severity
+- JSON only!
+Format:
 {{
-  "roadmap": [
+  "roadmap":[
     {{
-      "title": "Day 1 — Short title",
-      "actions": [
-        "09:00 Action 1 sentence.",
-        "13:00 Action 2 sentence."
-      ],
-      "warning": "Short warning sentence or null."
-    }},
-    ...
+      "title":"Day 1 — Short title",
+      "actions":["Drink water","Rest eyes"],
+      "warning":null
+    }}
   ]
 }}
 """
@@ -538,98 +528,61 @@ Return STRICT JSON ONLY. No explanation, no markdown.
         model = genai.GenerativeModel("models/gemini-2.5-pro")
         res = model.generate_content(prompt)
         text = (res.text or "").strip()
+
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?", "", text).strip()
             text = re.sub(r"```$", "", text).strip()
+
         parsed = json.loads(text)
         roadmap = parsed.get("roadmap", [])
-        if not isinstance(roadmap, list):
-            raise ValueError("roadmap is not a list")
+
     except Exception as e:
-        print("ROADMAP AI ERROR:", e)
-        roadmap = [
-            {
-                "title": "Day 1 — Self-care",
-                "actions": [
-                    "09:00 Drink water regularly during the day.",
-                    "13:00 Take breaks from screens and rest your eyes.",
-                    "22:00 Try to get enough sleep tonight.",
-                ],
-                "warning": "If your symptoms worsen or do not improve in a few days, please see a healthcare professional.",
-            }
-        ]
+        print("ROADMAP ERROR:", e)
+        roadmap = [{
+            "title": "Day 1 — Basic care",
+            "actions": [
+                "Drink water regularly",
+                "Rest from screens",
+                "Sleep earlier tonight"
+            ],
+            "warning": "Seek a doctor if symptoms worsen."
+        }]
 
-    return {"condition": active, "roadmap": roadmap, "progress": progress}
+    # Save roadmap ONCE
+    doc_ref.update({"saved_roadmap": roadmap})
 
-# ---------- ROADMAP: update checkbox progress ----------
+    return {
+        "condition": active,
+        "roadmap": roadmap,
+        "progress": progress
+    }
+
+
 @app.post("/roadmap/update")
-async def update_roadmap_progress(body: RoadmapUpdateBody):
-    user = body.email.strip()
-    ref = db.collection(COLL).document(user)
+async def update_roadmap(body: dict):
+    """Update checked/un-checked actions in Firestore."""
+    email = body.get("email")
+    day = body.get("day")
+    action = body.get("action")
+    value = body.get("value")
+
+    ref = db.collection(COLL).document(email)
     snap = ref.get()
+
     if not snap.exists:
-        return {"ok": False, "error": "no user state"}
+        return {"ok": False, "error": "user not found"}
 
     state = snap.to_dict()
-    progress = state.get("roadmap_progress", {})
+    rp = state.get("roadmap_progress", {})
 
-    day_map = progress.get(body.day, {})
-    if not isinstance(day_map, dict):
-        day_map = {}
-    day_map[body.action] = body.value
-    progress[body.day] = day_map
+    if day not in rp:
+        rp[day] = {}
 
-    state["roadmap_progress"] = progress
-    ref.set(state)
+    rp[day][action] = value
+
+    ref.update({"roadmap_progress": rp})
     return {"ok": True}
 
-# ---------- CRON: send due reminders ----------
-@app.get("/cron/dispatchReminders")
-async def cron_dispatch():
-    sent = 0
-    now = now_utc()
-    users = db.collection(COLL).stream()
-    for doc in users:
-        uid = doc.id
-        st = doc.to_dict()
-        ac = st.get("active_condition")
-        rems = st.get("reminders", [])
-        if not ac or not rems:
-            continue
-
-        tok_snap = db.collection(TOKENS).document(uid).get()
-        if not tok_snap.exists:
-            continue
-        token = tok_snap.to_dict().get("token")
-        if not token:
-            continue
-
-        updated = False
-        for r in rems:
-            due = datetime.fromisoformat(r["next_at"])
-            if due <= now:
-                try:
-                    messaging.send(
-                        messaging.Message(
-                            notification=messaging.Notification(
-                                title=r.get("title", "Health reminder"),
-                                body=r.get("body", "How are you feeling?"),
-                            ),
-                            token=token,
-                        )
-                    )
-                    sent += 1
-                except Exception:
-                    pass
-
-                interval = int(r.get("every_hours", 4))
-                r["next_at"] = (now + timedelta(hours=interval)).isoformat()
-                updated = True
-
-        if updated:
-            db.collection(COLL).document(uid).update({"reminders": rems})
-
-    return {"ok": True, "sent": sent}
 
 # ---------- CRON: cleanup recycle bin -> anonymous archive after 30d ----------
 @app.get("/cron/cleanupRecycleBin")
