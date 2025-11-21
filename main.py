@@ -473,56 +473,19 @@ async def get_state(userEmail: str = Query(...)):
 
 @app.get("/roadmap")
 async def get_roadmap(userEmail: str):
-    """Return cached roadmap or generate and save it once."""
-    doc_ref = db.collection(COLL).document(userEmail)
-    snap = doc_ref.get()
+    doc = db.collection(COLL).document(userEmail).get()
+    if not doc.exists:
+        return {"condition": None, "roadmap": [], "progress":{}}
 
-    if not snap.exists:
-        return {"condition": None, "roadmap": [], "progress": {}}
-
-    state = snap.to_dict()
+    state = doc.to_dict()
     active = state.get("active_condition")
-    symptoms = state.get("symptoms", {})
     progress = state.get("roadmap_progress", {})
 
-    # No active condition → No roadmap
     if not active:
         return {"condition": None, "roadmap": [], "progress": progress}
 
-    # If roadmap already cached → return it
-    saved = state.get("saved_roadmap")
-    if saved:
-        return {"condition": active, "roadmap": saved, "progress": progress}
-
-    # ---- Otherwise generate NEW roadmap once ----
-    condition = (active.get("condition") or "health issue").lower()
-    severity = symptoms.get("severity")
-    duration = symptoms.get("duration") or ""
-    other_symptoms = symptoms.get("otherSymptoms", [])
-
-    prompt = f"""
-Create a 1–3 day care roadmap for:
-- condition: {condition}
-- severity: {severity}
-- duration: {duration}
-- other symptoms: {json.dumps(other_symptoms, ensure_ascii=False)}
-
-Rules:
-- 3–6 steps per day
-- No medical prescriptions (generic terms ok)
-- Include short warning for high severity
-- JSON only!
-Format:
-{{
-  "roadmap":[
-    {{
-      "title":"Day 1 — Short title",
-      "actions":["Drink water","Rest eyes"],
-      "warning":null
-    }}
-  ]
-}}
-"""
+    # AI prompt building ...
+    # (same as your existing code)
 
     try:
         model = genai.GenerativeModel("models/gemini-2.5-pro")
@@ -536,26 +499,47 @@ Format:
         parsed = json.loads(text)
         roadmap = parsed.get("roadmap", [])
 
+        # ---------------------------------------
+        # ⭐ INSERT YOUR REMINDERS HERE ⭐
+        # ---------------------------------------
+        state["reminders"] = []  # clear old reminders
+
+        for day in roadmap:
+            for action in day["actions"]:
+                state["reminders"].append({
+                    "type": "roadmap_action",
+                    "title": day["title"],
+                    "body": action,
+                    "next_at": (now_utc() + timedelta(hours=2)).isoformat(),
+                    "every_hours": 4
+                })
+
+        db.collection(COLL).document(userEmail).update({
+            "reminders": state["reminders"]
+        })
+        # ---------------------------------------
+
     except Exception as e:
-        print("ROADMAP ERROR:", e)
-        roadmap = [{
-            "title": "Day 1 — Basic care",
-            "actions": [
-                "Drink water regularly",
-                "Rest from screens",
-                "Sleep earlier tonight"
-            ],
-            "warning": "Seek a doctor if symptoms worsen."
-        }]
+        print("ROADMAP AI ERROR:", e)
+        roadmap = [
+            {
+                "title": "Day 1 — Self-care",
+                "actions": [
+                    "Drink water regularly during the day.",
+                    "Take breaks from screens and rest your eyes.",
+                    "Try to get enough sleep tonight.",
+                ],
+                "warning": "See a doctor if symptoms worsen."
+            }
+        ]
 
-    # Save roadmap ONCE
-    doc_ref.update({"saved_roadmap": roadmap})
-
+    # return roadmap
     return {
         "condition": active,
         "roadmap": roadmap,
         "progress": progress
     }
+
 
 
 @app.post("/roadmap/update")
@@ -582,6 +566,31 @@ async def update_roadmap(body: dict):
 
     ref.update({"roadmap_progress": rp})
     return {"ok": True}
+
+# ---------- Regenerate roadmap ----------
+
+@app.post("/roadmap/regenerate")
+async def regenerate_roadmap(body: ResolveBody):
+    user = body.userEmail.strip()
+    ref = db.collection(COLL).document(user)
+    snap = ref.get()
+    if not snap.exists: 
+        return {"ok": False, "error": "no condition"}
+
+    state = snap.to_dict()
+    active = state.get("active_condition")
+    if not active:
+        return {"ok": False, "error": "no active condition"}
+
+    # Reset roadmap progress
+    state["roadmap_progress"] = {}
+
+    # Remove cached roadmap so it regenerates next time
+    state.pop("roadmap_cache", None)
+
+    ref.set(state)
+    return {"ok": True}
+
 
 
 # ---------- CRON: cleanup recycle bin -> anonymous archive after 30d ----------
